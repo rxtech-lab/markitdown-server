@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-server
+  namespace: markitdown-server
+  labels:
+    app: markitdown-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: markitdown-server
+  template:
+    metadata:
+      labels:
+        app: markitdown-server
+    spec:
+      volumes:
+      containers:
+        - name: markitdown-server
+          image: sirily11/markitdown-server:latest
+          resources:
+            limits:
+              memory: "1024Mi"
+              cpu: "500m"
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+          envFrom:
+            - secretRef:
+                name: markitdown-server-secret
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: markitdown-server
+  namespace: markitdown-server
+  labels:
+    app: markitdown-server
+spec:
+  selector:
+    app: markitdown-server
+  ports:
+    - port: 8080
+      targetPort: 8000
+  type: ClusterIP
