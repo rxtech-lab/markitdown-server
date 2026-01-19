@@ -14,10 +14,10 @@ metadata:
 spec:
   tls:
     - hosts:
-        - markitdown.mcprouter.app
+        - markdownparser.mcprouter.app
       secretName: markitdown-tls
   rules:
-    - host: markitdown.mcprouter.app
+    - host: markdownparser.mcprouter.app
       http:
         paths:
           - path: /
