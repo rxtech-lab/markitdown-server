@@ -18,7 +18,7 @@ spec:
       volumes:
       containers:
         - name: markitdown-server
-          image: sirily11/markitdown-server:latest
+          image: ghcr.io/sirily11/markitdown-server:latest
           resources:
             limits:
               memory: "1024Mi"
