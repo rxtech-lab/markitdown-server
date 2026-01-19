@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: markitdown-ingress
-  namespace: mcp-router
+  namespace: markitdown-server
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/proxy-body-size: "1000m"
@@ -12,6 +12,7 @@ metadata:
     nginx.ingress.kubernetes.io/session-cookie-max-age: "86400"
     nginx.ingress.kubernetes.io/session-cookie-path: "/"
 spec:
+  ingressClassName: nginx
   tls:
     - hosts:
         - markdownparser.mcprouter.app
