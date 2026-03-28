@@ -5,7 +5,12 @@ Accept: application/json
 
 ###
 
-GET http://127.0.0.1:8000/hello/User
-Accept: application/json
+POST http://127.0.0.1:8000/convert/url
+Content-Type: application/json
+X-API-Key: your-api-key
+
+{
+  "url": "https://example.com/document.pdf"
+}
 
 ###
