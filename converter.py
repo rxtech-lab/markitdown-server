@@ -11,7 +11,7 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.environ["OPENAI_API_KEY"],
 )
-model = "google/gemini-2.5-flash-preview-05-20"
+model = "google/gemini-3-flash-preview"
 
 
 def download(url: str) -> str:
