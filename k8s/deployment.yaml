@@ -15,6 +15,9 @@ spec:
       labels:
         app: markitdown-server
     spec:
+      # Conversions can run for ~60s; let in-flight requests drain on rollout
+      # instead of being SIGKILLed after the default 30s.
+      terminationGracePeriodSeconds: 120
       volumes:
       containers:
         - name: markitdown-server
@@ -24,8 +27,15 @@ spec:
               memory: "1024Mi"
               cpu: "500m"
             requests:
-              memory: "128Mi"
+              # Baseline RSS is ~120-140Mi; a 128Mi request pinned memory
+              # utilization at ~100% and kept the HPA at max replicas.
+              memory: "384Mi"
               cpu: "250m"
+          env:
+            - name: REDIS_URL
+              value: "redis://markitdown-redis:6379/0"
+            - name: OPENAI_MODEL
+              value: "google/gemini-2.5-flash-preview-05-20"
           envFrom:
             - secretRef:
                 name: markitdown-server-secret
@@ -35,12 +45,16 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
 
 ---
 apiVersion: v1
