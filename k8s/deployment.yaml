@@ -24,18 +24,29 @@ spec:
           image: ghcr.io/sirily11/markitdown-server:latest
           resources:
             limits:
-              memory: "1024Mi"
-              cpu: "500m"
+              # PDF conversion is CPU-bound and now fans chunks out across
+              # worker processes; the limit has to exceed PDF_MAX_WORKERS
+              # cores or the workers just contend for the same slice.
+              memory: "2048Mi"
+              cpu: "2000m"
             requests:
               # Baseline RSS is ~120-140Mi; a 128Mi request pinned memory
               # utilization at ~100% and kept the HPA at max replicas.
-              memory: "384Mi"
-              cpu: "250m"
+              memory: "512Mi"
+              cpu: "500m"
           env:
             - name: REDIS_URL
               value: "redis://markitdown-redis:6379/0"
             - name: OPENAI_MODEL
               value: "google/gemini-2.5-flash-preview-05-20"
+            # Keep in step with the CPU limit above: each worker saturates
+            # roughly one core, and each costs ~150-200Mi of resident memory
+            # for its own markitdown import, so this trades against the
+            # memory limit too.
+            - name: PDF_MAX_WORKERS
+              value: "2"
+            - name: PDF_PAGES_PER_CHUNK
+              value: "20"
           envFrom:
             - secretRef:
                 name: markitdown-server-secret

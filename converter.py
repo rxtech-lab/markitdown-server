@@ -9,6 +9,8 @@ from openai import OpenAI
 import requests
 import tempfile
 
+from pdf_chunk import convert_pdf_chunked, should_chunk
+
 logger = logging.getLogger(__name__)
 
 client = OpenAI(
@@ -93,9 +95,17 @@ def convert(url: str) -> DocumentConverterResult:
     downloaded_at = time.monotonic()
     logger.info("downloaded %s in %.3fs", url, downloaded_at - started)
 
-    md = MarkItDown(llm_client=client, llm_model=model)
     try:
-        converted = md.convert(temp_file)
+        # Large PDFs are converted chunk-by-chunk across worker processes.
+        # Done whole-document, markitdown holds the parsed object graph for
+        # every page at once, which pins the container memory limit and
+        # serialises all the parsing onto one core.
+        if should_chunk(temp_file):
+            markdown = convert_pdf_chunked(temp_file)
+            converted = DocumentConverterResult(markdown=markdown)
+        else:
+            md = MarkItDown(llm_client=client, llm_model=model)
+            converted = md.convert(temp_file)
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)

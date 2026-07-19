@@ -1,0 +1,182 @@
+name: Tests
+
+on:
+  push:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libimage-exiftool-perl libmagic1
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest reportlab
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests/ -v
+
+  k8s-benchmark:
+    name: PDF Benchmark (Kubernetes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      IMAGE_TAG: ci-${{ github.sha }}
+      NAMESPACE: markitdown-server
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: markitdown-server:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start minikube
+        uses: medyagh/setup-minikube@v0.0.21
+        with:
+          driver: docker
+          cpus: 4
+          memory: 6000m
+          addons: metrics-server
+
+      - name: Load image into minikube
+        run: minikube image load "markitdown-server:${IMAGE_TAG}"
+
+      - name: Create secret
+        run: |
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          # PDF conversion never calls the LLM (that path is images only), so a
+          # placeholder key is enough to satisfy the import-time lookup.
+          kubectl create secret generic markitdown-server-secret \
+            -n "$NAMESPACE" \
+            --from-literal=OPENAI_API_KEY=ci-placeholder \
+            --from-literal=ADMIN_API_KEY=ci-test-key \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        run: |
+          cd k8s
+          kustomize edit set image \
+            "ghcr.io/sirily11/markitdown-server=markitdown-server:${IMAGE_TAG}"
+          kubectl apply -k .
+          # Drop the HPA for the benchmark. Conversion pegs the CPU, so the HPA
+          # scales to maxReplicas mid-run and then holds there for its 300s
+          # scale-down window. Two replicas behind the service make per-book
+          # timing and peak-memory attribution meaningless, since requests and
+          # the cgroup reads can land on different pods.
+          kubectl delete hpa markitdown-server-hpa -n "$NAMESPACE" --ignore-not-found
+          kubectl scale deployment/markitdown-server -n "$NAMESPACE" --replicas=1
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/markitdown-redis -n "$NAMESPACE" --timeout=300s || true
+          kubectl rollout status deployment/markitdown-server -n "$NAMESPACE" --timeout=300s
+
+      # No port-forward here on purpose: the benchmark restarts the pod between
+      # books, which tears a forward down, so the script manages its own.
+      - name: Benchmark Foundation books
+        env:
+          ADMIN_API_KEY: ci-test-key
+          LOCAL_PORT: "8080"
+        run: |
+          set -o pipefail
+          bash scripts/k8s-benchmark.sh | tee /tmp/benchmark.txt
+
+      - name: Build benchmark report
+        if: always()
+        run: |
+          # On failure the script appends per-book pod logs, so cap the size:
+          # a GitHub comment is rejected outright past ~65k characters.
+          if [ -f /tmp/benchmark.txt ]; then
+            head -c 55000 /tmp/benchmark.txt > /tmp/benchmark-trimmed.txt
+            if [ "$(wc -c < /tmp/benchmark.txt)" -gt 55000 ]; then
+              echo '... output truncated, see the k8s-logs artifact ...' \
+                >> /tmp/benchmark-trimmed.txt
+            fi
+          else
+            echo 'benchmark did not produce output' > /tmp/benchmark-trimmed.txt
+          fi
+          {
+            echo '<!-- markitdown-pdf-benchmark -->'
+            echo '## PDF conversion benchmark'
+            echo
+            echo '```'
+            cat /tmp/benchmark-trimmed.txt
+            echo '```'
+            echo
+            echo "Commit \`${GITHUB_SHA:0:7}\` · [workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          } > /tmp/benchmark-report.md
+          cat /tmp/benchmark-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Posted even when the benchmark fails -- a budget violation is exactly
+      # the result worth surfacing on the PR.
+      - name: Comment benchmark on PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # This workflow runs on push, not pull_request, so the PR number has
+          # to be looked up from the branch.
+          PR=$(gh pr list --head "$GITHUB_REF_NAME" --state open \
+                 --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            echo "No open PR for branch $GITHUB_REF_NAME; skipping comment."
+            exit 0
+          fi
+          # Edit the previous report rather than stacking a new comment on
+          # every push; fall back to creating one on the first run.
+          gh pr comment "$PR" --body-file /tmp/benchmark-report.md --edit-last \
+            || gh pr comment "$PR" --body-file /tmp/benchmark-report.md
+
+      - name: Collect pod diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/k8s-logs
+          # Per-book logs captured during the run. The pod is restarted between
+          # books, so these are the only copy of an earlier book's output.
+          cp -r /tmp/benchmark-pod-logs /tmp/k8s-logs/per-book 2>/dev/null || true
+          kubectl logs -n "$NAMESPACE" -l app=markitdown-server --tail=-1 \
+            > /tmp/k8s-logs/server-final.log 2>&1 || true
+          kubectl get pods -n "$NAMESPACE" -o wide > /tmp/k8s-logs/pods.txt 2>&1 || true
+          kubectl describe pods -n "$NAMESPACE" -l app=markitdown-server \
+            > /tmp/k8s-logs/describe.txt 2>&1 || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: k8s-logs
+          path: /tmp/k8s-logs/
+          retention-days: 7
