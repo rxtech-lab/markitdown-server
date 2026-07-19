@@ -1,10 +1,9 @@
-# Self-hosted libSQL server (sqld).
+# CI-only self-hosted libSQL server (sqld).
 #
 # The API and worker pods must share one database — a SQLite file on a pod's
 # local disk cannot be, which is why this exists rather than a PVC. For a
-# managed setup, delete this file from kustomization.yaml and point
-# TURSO_DATABASE_URL / TURSO_AUTH_TOKEN at hosted Turso instead; nothing in the
-# application changes.
+# Release deployments use the hosted Turso database configured in their Secret.
+# test.yaml applies this manifest only to its disposable minikube.
 #
 # Unlike the Redis it replaces, this is a durable store, not a cache: it holds
 # the queue and every job's state. Hence a PVC and Recreate rather than an

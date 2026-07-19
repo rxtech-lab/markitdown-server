@@ -1,8 +1,8 @@
-# In-cluster S3-compatible object storage.
+# CI-only in-cluster S3-compatible object storage.
 #
 # Holds source files, per-chunk markdown and the final paginated pages. For a
-# managed setup, delete this from kustomization.yaml and point the S3_* secret
-# values at R2 or AWS instead — the application only speaks the S3 API.
+# Release deployments use the real S3-compatible service configured in their
+# Secret. test.yaml applies this manifest only to its disposable minikube.
 #
 # Object expiry is a bucket lifecycle rule (see the bucket-setup Job below),
 # not something the application enforces.
