@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-worker
+  namespace: markitdown-server
+  labels:
+    app: markitdown-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: markitdown-worker
+  template:
+    metadata:
+      labels:
+        app: markitdown-worker
+    spec:
+      # A worker stops claiming on SIGTERM and finishes the chunk it holds.
+      # This is a courtesy, not a guarantee: if the pod is killed first, the
+      # chunk's lease expires and another worker reclaims it.
+      terminationGracePeriodSeconds: 180
+      containers:
+        - name: markitdown-worker
+          image: ghcr.io/sirily11/markitdown-server:latest
+          command: ["python", "-m", "worker"]
+          resources:
+            limits:
+              # One chunk at a time, so peak memory is bounded by chunk size
+              # rather than document size. This is what lets a fleet of small
+              # pods replace one 2Gi pod.
+              memory: "1024Mi"
+              cpu: "1000m"
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+          env:
+            # NOTE: `env` takes precedence over `envFrom`, so these in-cluster
+            # defaults win over anything of the same name in the secret. To run
+            # against hosted Turso or R2, delete the relevant entries and supply
+            # them via the secret instead — changing only the secret will not
+            # take effect while they are here.
+            # RABBITMQ_URL is intentionally absent here: it arrives whole from
+            # the secret via envFrom, so the broker (in-cluster rabbitmq.yaml
+            # vs a shared one in another namespace) is a secret-only change.
+            # It used to be pinned here only because it was assembled from
+            # $(RABBITMQ_USER) — and $(VAR) expands solely from earlier entries
+            # in this same list, never from envFrom.
+            - name: TURSO_DATABASE_URL
+              value: "http://markitdown-libsql:8080"
+            - name: S3_ENDPOINT
+              value: "http://markitdown-minio:9000"
+            - name: S3_BUCKET
+              value: "markitdown"
+            - name: OPENAI_MODEL
+              value: "google/gemini-3.1-flash-lite-preview"
+            - name: PDF_PAGES_PER_CHUNK
+              value: "20"
+            - name: MAX_ATTEMPTS
+              value: "3"
+            # One unacked message at a time: bounds memory to a chunk and keeps
+            # dispatch fair, so a slow worker stops receiving instead of
+            # hoarding a backlog while its peers idle.
+            - name: RABBITMQ_PREFETCH
+              value: "1"
+            - name: LEASE_TTL
+              value: "120"
+            - name: HEARTBEAT_INTERVAL
+              value: "30"
+            - name: SOURCE_CACHE_DIR
+              value: "/tmp/markitdown-src"
+          envFrom:
+            - secretRef:
+                name: markitdown-server-secret
+          volumeMounts:
+            - name: source-cache
+              mountPath: /tmp
+          livenessProbe:
+            # The worker serves no HTTP, so liveness is the freshness of a file
+            # the main loop touches each iteration. A process that is running
+            # but no longer claiming work would otherwise look healthy forever.
+            exec:
+              command:
+                - sh
+                - -c
+                - test $(( $(date +%s) - $(stat -c %Y /tmp/worker-alive) )) -lt 300
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        # Holds the source-file cache. emptyDir so a rescheduled pod starts
+        # cold rather than inheriting another node's files.
+        - name: source-cache
+          emptyDir:
+            sizeLimit: 4Gi

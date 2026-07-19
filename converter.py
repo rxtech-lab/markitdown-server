@@ -1,36 +1,51 @@
+"""
+Downloading source documents and converting them to markdown.
+
+The LLM client is built lazily. It used to be constructed at import time from a
+required ``OPENAI_API_KEY``, which meant any process that merely imported this
+module — including workers that never take the LLM path — crashed at startup
+without a key it did not need.
+
+markitdown is likewise imported lazily. It costs ~150-190 MiB of RSS, and the
+API pod imports this module only to download and hash files.
+"""
+import functools
 import logging
 import os
 import os.path
-import time
+import tempfile
 from urllib.parse import urlparse
 
-from markitdown import MarkItDown, DocumentConverterResult
-from openai import OpenAI
 import requests
-import tempfile
 
-from pdf_chunk import convert_pdf_chunked, should_chunk
+import config
 
 logger = logging.getLogger(__name__)
-
-client = OpenAI(
-    base_url="https://ai-gateway.vercel.sh/v1",
-    api_key=os.environ["OPENAI_API_KEY"],
-)
-model = os.environ.get("OPENAI_MODEL", "google/gemini-3.1-flash-lite-preview")
-
-# Seconds to wait for the connection and for each chunk of the response body.
-DOWNLOAD_CONNECT_TIMEOUT = float(os.environ.get("DOWNLOAD_CONNECT_TIMEOUT", "10"))
-DOWNLOAD_READ_TIMEOUT = float(os.environ.get("DOWNLOAD_READ_TIMEOUT", "30"))
-# Hard cap on the downloaded file size, in bytes (default 100 MiB).
-MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(100 * 1024 * 1024)))
 
 _CHUNK_SIZE = 64 * 1024
 
 
+@functools.lru_cache(maxsize=1)
+def get_llm_client():
+    """
+    Build the OpenAI client on first use.
+
+    Raises only when the LLM path is actually taken, so a missing key is a
+    per-request error rather than a startup crash.
+    """
+    from openai import OpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set, but LLM-assisted conversion was requested"
+        )
+    return OpenAI(base_url=config.OPENAI_BASE_URL, api_key=api_key)
+
+
 def download(url: str) -> str:
     """
-    Download a URL and return a file path.
+    Download a URL and return a temporary file path.
 
     Args:
         url (str): The URL to download.
@@ -38,13 +53,12 @@ def download(url: str) -> str:
     Returns:
         str: The temporary file path where the downloaded content is stored.
     """
-    with requests.get(
-            url,
-            stream=True,
-            timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
-    ) as response:
+    with requests.get(url, stream=True) as response:
         if response.status_code != 200:
-            raise Exception(f"Failed to download file from {url}, status code: {response.status_code}")
+            raise Exception(
+                f"Failed to download file from {url}, "
+                f"status code: {response.status_code}"
+            )
 
         # Extract filename from URL or use a default name
         parsed_url = urlparse(url)
@@ -52,7 +66,6 @@ def download(url: str) -> str:
         if not filename:
             filename = "downloaded_file"
 
-        # Create a temporary file with a name derived from the URL
         fd, temp_path = tempfile.mkstemp(suffix=f"_{filename}")
         os.close(fd)
 
@@ -64,9 +77,10 @@ def download(url: str) -> str:
                     if not chunk:
                         continue
                     written += len(chunk)
-                    if written > MAX_DOWNLOAD_BYTES:
+                    if written > config.MAX_DOWNLOAD_BYTES:
                         raise Exception(
-                            f"File from {url} exceeds the maximum size of {MAX_DOWNLOAD_BYTES} bytes"
+                            f"File from {url} exceeds the maximum size of "
+                            f"{config.MAX_DOWNLOAD_BYTES} bytes"
                         )
                     file.write(chunk)
         except Exception:
@@ -77,44 +91,20 @@ def download(url: str) -> str:
         return temp_path
 
 
-def convert(url: str) -> DocumentConverterResult:
+def convert_file(path: str, use_llm: bool = False) -> str:
     """
-    Convert a URL to a MarkItDown object.
+    Convert a local file to markdown.
 
-    This is fully synchronous and CPU/IO blocking; callers running inside an
-    event loop must offload it to a worker thread.
-
-    Args:
-        url (str): The URL to convert.
-
-    Returns:
-        MarkItDown: The converted MarkItDown object.
+    The single conversion primitive. Previously the LLM was used or skipped
+    depending on whether a document happened to cross the 40-page chunking
+    threshold, so a 39-page PDF got image descriptions and a 40-page one did
+    not — a behaviour flip no caller could predict. ``use_llm`` now says so
+    explicitly and applies uniformly to every chunk of a document.
     """
-    started = time.monotonic()
-    temp_file = download(url)
-    downloaded_at = time.monotonic()
-    logger.info("downloaded %s in %.3fs", url, downloaded_at - started)
+    from markitdown import MarkItDown
 
-    try:
-        # Large PDFs are converted chunk-by-chunk across worker processes.
-        # Done whole-document, markitdown holds the parsed object graph for
-        # every page at once, which pins the container memory limit and
-        # serialises all the parsing onto one core.
-        if should_chunk(temp_file):
-            markdown = convert_pdf_chunked(temp_file)
-            converted = DocumentConverterResult(markdown=markdown)
-        else:
-            md = MarkItDown(llm_client=client, llm_model=model)
-            converted = md.convert(temp_file)
-    finally:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-
-    logger.info(
-        "converted %s in %.3fs (download %.3fs, convert %.3fs)",
-        url,
-        time.monotonic() - started,
-        downloaded_at - started,
-        time.monotonic() - downloaded_at,
-    )
-    return converted
+    if use_llm:
+        md = MarkItDown(llm_client=get_llm_client(), llm_model=config.OPENAI_MODEL)
+    else:
+        md = MarkItDown()
+    return md.convert(path).markdown

@@ -100,12 +100,17 @@ jobs:
           kubectl kustomize . | kubectl apply -f -
 
           # Update the deployment with the specific release tag
-          kubectl set image deployment/markitdown-server markitdown-server=ghcr.io/${{ github.repository_owner }}/markitdown-server:${VERSION} -n markitdown-server
+          # One image, two deployments: the producer (API) and the consumer
+          # (worker) must move together or a new worker could read job rows
+          # written by an old producer.
+          kubectl set image deployment/markitdown-api markitdown-api=ghcr.io/${{ github.repository_owner }}/markitdown-server:${VERSION} -n markitdown-server
+          kubectl set image deployment/markitdown-worker markitdown-worker=ghcr.io/${{ github.repository_owner }}/markitdown-server:${VERSION} -n markitdown-server
 
           # Wait for rollout to complete
-          kubectl rollout status deployment/markitdown-server -n markitdown-server --timeout=300s
+          kubectl rollout status deployment/markitdown-api -n markitdown-server --timeout=300s
+          kubectl rollout status deployment/markitdown-worker -n markitdown-server --timeout=300s
 
       - name: Verify deployment
         run: |
-          kubectl get pods -n markitdown-server -l app=markitdown-server
+          kubectl get pods -n markitdown-server
           kubectl get service -n markitdown-server markitdown-server

@@ -1,0 +1,108 @@
+# RabbitMQ — job distribution.
+#
+# The API publishes one message per chunk; workers consume with prefetch=1, so
+# the broker hands each chunk to whichever worker is free. Adding a worker pod
+# adds throughput with no coordination.
+#
+# Durable queues and persistent messages, backed by a PVC: a broker restart
+# must not lose queued work, since a dropped message means a job that never
+# finishes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: markitdown-rabbitmq-data
+  namespace: markitdown-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-rabbitmq
+  namespace: markitdown-server
+  labels:
+    app: markitdown-rabbitmq
+spec:
+  replicas: 1
+  strategy:
+    # One node owns the message store on the PVC; a rolling update would have
+    # two pods contend for it.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: markitdown-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: markitdown-rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4-management-alpine
+          ports:
+            - containerPort: 5672
+              name: amqp
+            - containerPort: 15672
+              name: management
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: RABBITMQ_USER
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: RABBITMQ_PASSWORD
+          resources:
+            limits:
+              memory: "1024Mi"
+              cpu: "1000m"
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: markitdown-rabbitmq-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: markitdown-rabbitmq
+  namespace: markitdown-server
+  labels:
+    app: markitdown-rabbitmq
+spec:
+  selector:
+    app: markitdown-rabbitmq
+  ports:
+    - port: 5672
+      targetPort: 5672
+      name: amqp
+    - port: 15672
+      targetPort: 15672
+      name: management
+  type: ClusterIP

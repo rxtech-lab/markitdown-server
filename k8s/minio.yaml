@@ -1,0 +1,143 @@
+# In-cluster S3-compatible object storage.
+#
+# Holds source files, per-chunk markdown and the final paginated pages. For a
+# managed setup, delete this from kustomization.yaml and point the S3_* secret
+# values at R2 or AWS instead — the application only speaks the S3 API.
+#
+# Object expiry is a bucket lifecycle rule (see the bucket-setup Job below),
+# not something the application enforces.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: markitdown-minio-data
+  namespace: markitdown-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-minio
+  namespace: markitdown-server
+  labels:
+    app: markitdown-minio
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: markitdown-minio
+  template:
+    metadata:
+      labels:
+        app: markitdown-minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+              name: s3
+            - containerPort: 9001
+              name: console
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: S3_ACCESS_KEY_ID
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: S3_SECRET_ACCESS_KEY
+          resources:
+            limits:
+              memory: "1024Mi"
+              cpu: "1000m"
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: markitdown-minio-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: markitdown-minio
+  namespace: markitdown-server
+  labels:
+    app: markitdown-minio
+spec:
+  selector:
+    app: markitdown-minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+      name: s3
+  type: ClusterIP
+
+---
+# Creates the bucket and sets the 7-day expiry. Idempotent, so re-running a
+# deploy is safe; `backoffLimit` retries while minio is still starting.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: markitdown-minio-setup
+  namespace: markitdown-server
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:latest
+          env:
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: S3_ACCESS_KEY_ID
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: markitdown-server-secret
+                  key: S3_SECRET_ACCESS_KEY
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mc alias set local http://markitdown-minio:9000 \
+                "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY"
+              mc mb --ignore-existing local/markitdown
+              # Expiry is enforced here rather than in application code, so
+              # every object for a document ages out together.
+              mc ilm rule add local/markitdown --expire-days 7 || true
+              echo "bucket ready"

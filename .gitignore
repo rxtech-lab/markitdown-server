@@ -3,4 +3,14 @@
 __pycache__
 .DS_Store
 .vercel
-secrets.yaml
+# Real credentials. The trailing * also covers editor/backup spill
+# (secrets.yaml.bak, .orig, .save); secrets.example.yaml is not matched and
+# stays tracked as the template.
+secrets.yaml*
+.venv
+venv
+.pytest_cache
+# Local sqlite database, used when TURSO_DATABASE_URL points at a file.
+*.db
+*.db-wal
+*.db-shm
