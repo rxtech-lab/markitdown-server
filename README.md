@@ -121,11 +121,11 @@ your real secrets. `make reset` wipes the volumes.
 
 ## Deployment
 
-`k8s/` is a kustomize stack: an API deployment, a worker deployment (HPA'd on
-CPU), plus self-hosted libSQL and minio for state. To run fully managed, drop
-`libsql.yaml` and `minio.yaml` from `kustomization.yaml` and point the secret at
-hosted Turso and R2/S3 — note that the inline `env` entries in the deployments
-take precedence over `envFrom`, so those must be removed too.
+`k8s/` is a release kustomize stack containing the API, worker, HPAs and
+ingress. Their RabbitMQ, Turso and S3 connection settings come from
+`markitdown-server-secret`; release deployment does not provision those shared
+services. The Kubernetes benchmark explicitly deploys the bundled RabbitMQ,
+libSQL and MinIO manifests only inside its disposable CI minikube cluster.
 
 `scripts/k8s-benchmark.sh` converts four real Asimov PDFs against a cluster and
 enforces per-book time and memory budgets; it is the performance regression

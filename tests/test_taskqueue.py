@@ -5,6 +5,9 @@ The broker itself is not under test; what is, is the message round trip and the
 declaration arguments, since a wrong dead-letter setting silently sends retries
 to the wrong place and only shows up under load.
 """
+import pika
+import pytest
+
 import config
 import taskqueue
 from taskqueue import ChunkTask
@@ -143,3 +146,90 @@ class TestTopology:
         before = (len(ch.queues), len(ch.exchanges))
         taskqueue.declare(ch)
         assert (len(ch.queues), len(ch.exchanges)) == before
+
+
+class PublishingChannel:
+    """A channel that fails its first N publishes with a lost stream."""
+
+    def __init__(self, failures=0):
+        self.failures = failures
+        self.published = []
+
+    def basic_publish(self, exchange, routing_key, body, properties=None):
+        if self.failures > 0:
+            self.failures -= 1
+            raise pika.exceptions.StreamLostError("Stream connection lost")
+        self.published.append((exchange, routing_key, body))
+
+
+class TestStaleConnection:
+    """
+    The producer only touches its connection when a request arrives, so an idle
+    BlockingConnection misses heartbeats and the broker closes it. The next
+    publish then dies mid-request and the caller sees a 400 for a file that is
+    perfectly convertible — which is exactly what a long-running job between
+    two submissions caused in CI.
+    """
+
+    def channels(self, monkeypatch, first_failures):
+        """Hand out a broken channel first, then a healthy one."""
+        made = [PublishingChannel(failures=first_failures), PublishingChannel()]
+        handed = []
+
+        def fake_channel():
+            ch = made[min(len(handed), len(made) - 1)]
+            handed.append(ch)
+            return ch
+
+        monkeypatch.setattr(taskqueue, "channel", fake_channel)
+        monkeypatch.setattr(taskqueue, "close", lambda: handed.append(None))
+        return made
+
+    def test_publish_survives_a_dropped_connection(self, monkeypatch):
+        stale, fresh = self.channels(monkeypatch, first_failures=1)
+        taskqueue.publish([make_task()])
+        assert stale.published == []
+        assert len(fresh.published) == 1
+
+    def test_reconnect_drops_the_stale_connection_first(self, monkeypatch):
+        """Without close(), connect() returns the same dead connection and the
+        retry fails identically."""
+        closed = []
+        monkeypatch.setattr(taskqueue, "close", lambda: closed.append(True))
+        made = [PublishingChannel(failures=1), PublishingChannel()]
+        monkeypatch.setattr(taskqueue, "channel", lambda: made.pop(0) if len(made) > 1 else made[0])
+        taskqueue.publish([make_task()])
+        assert closed == [True]
+
+    def test_every_task_reaches_the_broker_after_a_reconnect(self, monkeypatch):
+        _, fresh = self.channels(monkeypatch, first_failures=1)
+        taskqueue.publish([make_task(chunk_index=i) for i in range(4)])
+        assert len(fresh.published) == 4
+
+    def test_a_second_failure_propagates(self, monkeypatch):
+        """One retry, not an infinite loop: a genuinely down broker must still
+        surface as an error rather than hang the request."""
+        ch = PublishingChannel(failures=99)
+        monkeypatch.setattr(taskqueue, "channel", lambda: ch)
+        monkeypatch.setattr(taskqueue, "close", lambda: None)
+        with pytest.raises(pika.exceptions.AMQPError):
+            taskqueue.publish([make_task()])
+
+    def test_retry_publish_reconnects_too(self, monkeypatch):
+        _, fresh = self.channels(monkeypatch, first_failures=1)
+        taskqueue.publish_retry(make_task())
+        assert len(fresh.published) == 1
+
+    def test_failed_publish_reconnects_too(self, monkeypatch):
+        _, fresh = self.channels(monkeypatch, first_failures=1)
+        taskqueue.publish_failed(make_task(), "boom")
+        assert len(fresh.published) == 1
+
+    def test_a_healthy_connection_is_not_reopened(self, monkeypatch):
+        closed = []
+        monkeypatch.setattr(taskqueue, "close", lambda: closed.append(True))
+        ch = PublishingChannel()
+        monkeypatch.setattr(taskqueue, "channel", lambda: ch)
+        taskqueue.publish([make_task()])
+        assert closed == []
+        assert len(ch.published) == 1

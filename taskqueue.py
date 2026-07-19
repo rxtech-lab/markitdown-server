@@ -159,41 +159,50 @@ _PERSISTENT = pika.BasicProperties(
 )
 
 
+def _publish(exchange: str, routing_key: str, bodies: list[bytes]) -> None:
+    """
+    Publish bodies, reconnecting once if the cached connection has gone stale.
+
+    The producer only touches its connection when a request arrives, so a
+    BlockingConnection sitting idle between submissions never gets to send a
+    heartbeat and the broker eventually closes it. ``is_open`` still reports
+    True until the socket error surfaces, so the staleness can only be
+    discovered by publishing — hence retry rather than a pre-flight check.
+    """
+    try:
+        ch = channel()
+        for body in bodies:
+            ch.basic_publish(exchange=exchange, routing_key=routing_key,
+                             body=body, properties=_PERSISTENT)
+        return
+    except pika.exceptions.AMQPError:
+        logger.warning("publish failed, reconnecting to rabbitmq", exc_info=True)
+
+    close()
+    ch = channel()
+    for body in bodies:
+        ch.basic_publish(exchange=exchange, routing_key=routing_key,
+                         body=body, properties=_PERSISTENT)
+
+
 def publish(tasks: list[ChunkTask]) -> None:
     """Publish chunk tasks onto the work queue."""
-    ch = channel()
-    for task in tasks:
-        ch.basic_publish(
-            exchange=config.RABBITMQ_EXCHANGE,
-            routing_key=config.RABBITMQ_QUEUE,
-            body=task.to_bytes(),
-            properties=_PERSISTENT,
-        )
+    _publish(config.RABBITMQ_EXCHANGE, config.RABBITMQ_QUEUE,
+             [task.to_bytes() for task in tasks])
 
 
 def publish_retry(task: ChunkTask) -> None:
     """Schedule a failed chunk for another attempt after its backoff delay."""
-    ch = channel()
     queue = retry_queue_name(task.attempt)
-    ch.basic_publish(
-        exchange=RETRY_EXCHANGE,
-        routing_key=queue,
-        body=task.next_attempt().to_bytes(),
-        properties=_PERSISTENT,
-    )
+    _publish(RETRY_EXCHANGE, queue, [task.next_attempt().to_bytes()])
     logger.info("chunk %d of job %s retrying via %s",
                 task.chunk_index, task.job_id, queue)
 
 
 def publish_failed(task: ChunkTask, error: str) -> None:
     """Park a chunk that exhausted its attempts on the failed queue."""
-    ch = channel()
-    ch.basic_publish(
-        exchange=DLX_EXCHANGE,
-        routing_key=config.RABBITMQ_QUEUE,
-        body=json.dumps({**asdict(task), "error": error[:2000]}).encode(),
-        properties=_PERSISTENT,
-    )
+    _publish(DLX_EXCHANGE, config.RABBITMQ_QUEUE,
+             [json.dumps({**asdict(task), "error": error[:2000]}).encode()])
 
 
 def consume(handler: Callable[[ChunkTask], None], should_stop: Callable[[], bool]) -> None:

@@ -1,4 +1,8 @@
-# RabbitMQ — job distribution.
+# CI-only RabbitMQ — job distribution.
+#
+# Release deployments use the shared cluster broker configured by RABBITMQ_URL
+# in their Secret. test.yaml applies this manifest only to its disposable
+# minikube.
 #
 # The API publishes one message per chunk; workers consume with prefetch=1, so
 # the broker hands each chunk to whichever worker is free. Adding a worker pod

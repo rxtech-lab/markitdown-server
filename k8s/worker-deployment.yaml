@@ -34,23 +34,10 @@ spec:
               memory: "512Mi"
               cpu: "500m"
           env:
-            # NOTE: `env` takes precedence over `envFrom`, so these in-cluster
-            # defaults win over anything of the same name in the secret. To run
-            # against hosted Turso or R2, delete the relevant entries and supply
-            # them via the secret instead — changing only the secret will not
-            # take effect while they are here.
-            # RABBITMQ_URL is intentionally absent here: it arrives whole from
-            # the secret via envFrom, so the broker (in-cluster rabbitmq.yaml
-            # vs a shared one in another namespace) is a secret-only change.
-            # It used to be pinned here only because it was assembled from
-            # $(RABBITMQ_USER) — and $(VAR) expands solely from earlier entries
-            # in this same list, never from envFrom.
-            - name: TURSO_DATABASE_URL
-              value: "http://markitdown-libsql:8080"
-            - name: S3_ENDPOINT
-              value: "http://markitdown-minio:9000"
-            - name: S3_BUCKET
-              value: "markitdown"
+            # Database, object-storage and RabbitMQ connection settings all
+            # arrive from the Secret via envFrom. CI creates that Secret with
+            # disposable in-cluster endpoints; releases use real shared
+            # services without pod-spec overrides taking precedence.
             - name: OPENAI_MODEL
               value: "google/gemini-3.1-flash-lite-preview"
             - name: PDF_PAGES_PER_CHUNK
