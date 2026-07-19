@@ -1,5 +1,7 @@
+import logging
 import os
 import os.path
+import time
 from urllib.parse import urlparse
 
 from markitdown import MarkItDown, DocumentConverterResult
@@ -7,11 +9,23 @@ from openai import OpenAI
 import requests
 import tempfile
 
+from pdf_chunk import convert_pdf_chunked, should_chunk
+
+logger = logging.getLogger(__name__)
+
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
+    base_url="https://ai-gateway.vercel.sh/v1",
     api_key=os.environ["OPENAI_API_KEY"],
 )
-model = "google/gemini-3-flash-preview"
+model = os.environ.get("OPENAI_MODEL", "google/gemini-3.1-flash-lite-preview")
+
+# Seconds to wait for the connection and for each chunk of the response body.
+DOWNLOAD_CONNECT_TIMEOUT = float(os.environ.get("DOWNLOAD_CONNECT_TIMEOUT", "10"))
+DOWNLOAD_READ_TIMEOUT = float(os.environ.get("DOWNLOAD_READ_TIMEOUT", "30"))
+# Hard cap on the downloaded file size, in bytes (default 100 MiB).
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(100 * 1024 * 1024)))
+
+_CHUNK_SIZE = 64 * 1024
 
 
 def download(url: str) -> str:
@@ -24,8 +38,14 @@ def download(url: str) -> str:
     Returns:
         str: The temporary file path where the downloaded content is stored.
     """
-    response = requests.get(url)
-    if response.status_code == 200:
+    with requests.get(
+            url,
+            stream=True,
+            timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
+    ) as response:
+        if response.status_code != 200:
+            raise Exception(f"Failed to download file from {url}, status code: {response.status_code}")
+
         # Extract filename from URL or use a default name
         parsed_url = urlparse(url)
         filename = os.path.basename(parsed_url.path)
@@ -36,17 +56,33 @@ def download(url: str) -> str:
         fd, temp_path = tempfile.mkstemp(suffix=f"_{filename}")
         os.close(fd)
 
-        # Write content to the temporary file
-        with open(temp_path, 'wb') as file:
-            file.write(response.content)
+        # Stream the content to the temporary file so memory stays bounded
+        written = 0
+        try:
+            with open(temp_path, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_DOWNLOAD_BYTES:
+                        raise Exception(
+                            f"File from {url} exceeds the maximum size of {MAX_DOWNLOAD_BYTES} bytes"
+                        )
+                    file.write(chunk)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
         return temp_path
-    else:
-        raise Exception(f"Failed to download file from {url}, status code: {response.status_code}")
 
 
 def convert(url: str) -> DocumentConverterResult:
     """
     Convert a URL to a MarkItDown object.
+
+    This is fully synchronous and CPU/IO blocking; callers running inside an
+    event loop must offload it to a worker thread.
 
     Args:
         url (str): The URL to convert.
@@ -54,9 +90,31 @@ def convert(url: str) -> DocumentConverterResult:
     Returns:
         MarkItDown: The converted MarkItDown object.
     """
+    started = time.monotonic()
     temp_file = download(url)
-    md = MarkItDown(llm_client=client, llm_model=model)
-    converted = md.convert(temp_file)
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
+    downloaded_at = time.monotonic()
+    logger.info("downloaded %s in %.3fs", url, downloaded_at - started)
+
+    try:
+        # Large PDFs are converted chunk-by-chunk across worker processes.
+        # Done whole-document, markitdown holds the parsed object graph for
+        # every page at once, which pins the container memory limit and
+        # serialises all the parsing onto one core.
+        if should_chunk(temp_file):
+            markdown = convert_pdf_chunked(temp_file)
+            converted = DocumentConverterResult(markdown=markdown)
+        else:
+            md = MarkItDown(llm_client=client, llm_model=model)
+            converted = md.convert(temp_file)
+    finally:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    logger.info(
+        "converted %s in %.3fs (download %.3fs, convert %.3fs)",
+        url,
+        time.monotonic() - started,
+        downloaded_at - started,
+        time.monotonic() - downloaded_at,
+    )
     return converted

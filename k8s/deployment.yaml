@@ -15,17 +15,38 @@ spec:
       labels:
         app: markitdown-server
     spec:
+      # Conversions can run for ~60s; let in-flight requests drain on rollout
+      # instead of being SIGKILLed after the default 30s.
+      terminationGracePeriodSeconds: 120
       volumes:
       containers:
         - name: markitdown-server
           image: ghcr.io/sirily11/markitdown-server:latest
           resources:
             limits:
-              memory: "1024Mi"
-              cpu: "500m"
+              # PDF conversion is CPU-bound and now fans chunks out across
+              # worker processes; the limit has to exceed PDF_MAX_WORKERS
+              # cores or the workers just contend for the same slice.
+              memory: "2048Mi"
+              cpu: "2000m"
             requests:
-              memory: "128Mi"
-              cpu: "250m"
+              # Baseline RSS is ~120-140Mi; a 128Mi request pinned memory
+              # utilization at ~100% and kept the HPA at max replicas.
+              memory: "512Mi"
+              cpu: "500m"
+          env:
+            - name: REDIS_URL
+              value: "redis://markitdown-redis:6379/0"
+            - name: OPENAI_MODEL
+              value: "google/gemini-2.5-flash-preview-05-20"
+            # Keep in step with the CPU limit above: each worker saturates
+            # roughly one core, and each costs ~150-200Mi of resident memory
+            # for its own markitdown import, so this trades against the
+            # memory limit too.
+            - name: PDF_MAX_WORKERS
+              value: "2"
+            - name: PDF_PAGES_PER_CHUNK
+              value: "20"
           envFrom:
             - secretRef:
                 name: markitdown-server-secret
@@ -35,12 +56,16 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
 
 ---
 apiVersion: v1

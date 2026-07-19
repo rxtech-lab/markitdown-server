@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-redis
+  namespace: markitdown-server
+  labels:
+    app: markitdown-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: markitdown-redis
+  template:
+    metadata:
+      labels:
+        app: markitdown-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # Ephemeral cache only (5 min TTL); cap memory and evict on pressure.
+          args:
+            - "--maxmemory"
+            - "256mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+            - "--save"
+            - ""
+          ports:
+            - containerPort: 6379
+          resources:
+            limits:
+              memory: "320Mi"
+              cpu: "250m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: markitdown-redis
+  namespace: markitdown-server
+  labels:
+    app: markitdown-redis
+spec:
+  selector:
+    app: markitdown-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+  type: ClusterIP
