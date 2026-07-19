@@ -3,9 +3,15 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install system dependencies
+#   ffmpeg          - required by pydub for audio transcription
+#   libimage-exiftool-perl - required by markitdown for image/audio metadata
+#   libmagic1       - content type sniffing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
+    ffmpeg \
+    libimage-exiftool-perl \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install dependencies
