@@ -28,5 +28,6 @@ EXPOSE 8000
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Run the server
+# One image, two roles. The default is the API (producer); worker pods override
+# the command with ["python", "-m", "worker"] to run the consumer instead.
 CMD ["uvicorn", "api.index:app", "--host", "0.0.0.0", "--port", "8000"]

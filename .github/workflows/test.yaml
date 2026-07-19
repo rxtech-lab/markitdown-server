@@ -29,12 +29,14 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest reportlab
+          pip install pytest reportlab httpx "moto[s3]"
 
+      # No database or object-store service container needed: the tests run
+      # against stdlib sqlite3 and an in-process moto S3. db.py picks the
+      # sqlite driver for any non-server DATABASE_URL, so the same code paths
+      # are exercised here as in the cluster.
       - name: Run unit tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: pytest tests/ -v
+        run: pytest -v
 
   k8s-benchmark:
     name: PDF Benchmark (Kubernetes)
@@ -77,12 +79,21 @@ jobs:
       - name: Create secret
         run: |
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-          # PDF conversion never calls the LLM (that path is images only), so a
-          # placeholder key is enough to satisfy the import-time lookup.
+          # Conversion only calls the LLM when use_llm is requested, which the
+          # benchmark does not do, so a placeholder key is enough.
+          # RABBITMQ_URL points at the in-cluster broker from rabbitmq.yaml:
+          # the runner has no route to the shared linda-namespace broker the
+          # real secret uses. RABBITMQ_USER/PASSWORD are what that broker boots
+          # with, so the two must agree.
           kubectl create secret generic markitdown-server-secret \
             -n "$NAMESPACE" \
             --from-literal=OPENAI_API_KEY=ci-placeholder \
             --from-literal=ADMIN_API_KEY=ci-test-key \
+            --from-literal=S3_ACCESS_KEY_ID=ci-minio-user \
+            --from-literal=S3_SECRET_ACCESS_KEY=ci-minio-password \
+            --from-literal=RABBITMQ_USER=ci-rabbit-user \
+            --from-literal=RABBITMQ_PASSWORD=ci-rabbit-password \
+            --from-literal=RABBITMQ_URL='amqp://ci-rabbit-user:ci-rabbit-password@markitdown-rabbitmq:5672/%2F' \
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Deploy
@@ -91,18 +102,24 @@ jobs:
           kustomize edit set image \
             "ghcr.io/sirily11/markitdown-server=markitdown-server:${IMAGE_TAG}"
           kubectl apply -k .
-          # Drop the HPA for the benchmark. Conversion pegs the CPU, so the HPA
-          # scales to maxReplicas mid-run and then holds there for its 300s
-          # scale-down window. Two replicas behind the service make per-book
-          # timing and peak-memory attribution meaningless, since requests and
-          # the cgroup reads can land on different pods.
-          kubectl delete hpa markitdown-server-hpa -n "$NAMESPACE" --ignore-not-found
-          kubectl scale deployment/markitdown-server -n "$NAMESPACE" --replicas=1
+          # Drop the worker HPA and pin the worker to one replica. Conversion
+          # pegs the CPU, so the HPA would scale up mid-run and hold there for
+          # its scale-down window; with a worker fleet, peak memory is spread
+          # across pods and no single cgroup reading means anything.
+          kubectl delete hpa markitdown-worker-hpa -n "$NAMESPACE" --ignore-not-found
+          kubectl delete hpa markitdown-api-hpa -n "$NAMESPACE" --ignore-not-found
+          kubectl scale deployment/markitdown-worker -n "$NAMESPACE" --replicas=1
 
       - name: Wait for rollout
         run: |
-          kubectl rollout status deployment/markitdown-redis -n "$NAMESPACE" --timeout=300s || true
-          kubectl rollout status deployment/markitdown-server -n "$NAMESPACE" --timeout=300s
+          # State first: the API and worker both fail readiness until these are
+          # up, so rolling them out in order keeps the failure legible.
+          kubectl rollout status deployment/markitdown-libsql -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/markitdown-minio -n "$NAMESPACE" --timeout=300s
+          kubectl wait --for=condition=complete job/markitdown-minio-setup \
+            -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/markitdown-api -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/markitdown-worker -n "$NAMESPACE" --timeout=300s
 
       # No port-forward here on purpose: the benchmark restarts the pod between
       # books, which tears a forward down, so the script manages its own.
@@ -167,10 +184,16 @@ jobs:
           # Per-book logs captured during the run. The pod is restarted between
           # books, so these are the only copy of an earlier book's output.
           cp -r /tmp/benchmark-pod-logs /tmp/k8s-logs/per-book 2>/dev/null || true
-          kubectl logs -n "$NAMESPACE" -l app=markitdown-server --tail=-1 \
-            > /tmp/k8s-logs/server-final.log 2>&1 || true
+          kubectl logs -n "$NAMESPACE" -l app=markitdown-api --tail=-1 \
+            > /tmp/k8s-logs/api-final.log 2>&1 || true
+          kubectl logs -n "$NAMESPACE" -l app=markitdown-worker --tail=-1 \
+            > /tmp/k8s-logs/worker-final.log 2>&1 || true
+          kubectl logs -n "$NAMESPACE" -l app=markitdown-libsql --tail=200 \
+            > /tmp/k8s-logs/libsql.log 2>&1 || true
+          kubectl logs -n "$NAMESPACE" -l app=markitdown-minio --tail=200 \
+            > /tmp/k8s-logs/minio.log 2>&1 || true
           kubectl get pods -n "$NAMESPACE" -o wide > /tmp/k8s-logs/pods.txt 2>&1 || true
-          kubectl describe pods -n "$NAMESPACE" -l app=markitdown-server \
+          kubectl describe pods -n "$NAMESPACE" \
             > /tmp/k8s-logs/describe.txt 2>&1 || true
 
       - name: Upload diagnostics

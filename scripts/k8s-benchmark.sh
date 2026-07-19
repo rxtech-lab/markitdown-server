@@ -14,6 +14,13 @@
 # reset in place -- the deployment is restarted before each book instead, which
 # both gives a true per-book peak and makes every book start from a cold pod.
 #
+# Conversion is asynchronous now, so a book is timed from submit to the job
+# reporting `done`, not from a single blocking POST. The memory that matters
+# moved with it: the API pod only downloads and hashes, so the tracked pod is
+# the *worker*. Worker replicas must be pinned to 1 for the same reason a single
+# replica was needed before -- with a fleet, peak memory is spread across pods
+# and no single cgroup reading means anything.
+#
 # Expects: kubectl context pointing at the cluster and $ADMIN_API_KEY set. The
 # port-forward is managed here, since restarting the pod tears it down.
 set -uo pipefail
@@ -21,6 +28,11 @@ set -uo pipefail
 NAMESPACE="${NAMESPACE:-markitdown-server}"
 LOCAL_PORT="${LOCAL_PORT:-8080}"
 BASE_URL="http://localhost:${LOCAL_PORT}"
+# The deployment whose memory is measured and which is restarted between books.
+WORKER_LABEL="${WORKER_LABEL:-markitdown-worker}"
+API_LABEL="${API_LABEL:-markitdown-api}"
+# How long to poll a job before declaring it hung. Set per-book from the budget.
+POLL_INTERVAL="${POLL_INTERVAL:-2}"
 # Scales every time budget at once, for slower runners or local use.
 BUDGET_SCALE="${BUDGET_SCALE:-1.0}"
 # Fail if peak memory exceeds this share of the pod's limit.
@@ -83,7 +95,7 @@ to_mib() {
 # after a rollout restart the outgoing pod keeps being counted long after the
 # new one is serving. Filter on deletionTimestamp and readiness instead.
 running_pod_names() {
-  kubectl get pods -n "$NAMESPACE" -l app=markitdown-server -o json 2>/dev/null \
+  kubectl get pods -n "$NAMESPACE" -l "app=${WORKER_LABEL}" -o json 2>/dev/null \
     | jq -r '.items[]
              | select(.metadata.deletionTimestamp == null)
              | select(.status.phase == "Running")
@@ -147,6 +159,8 @@ slugify() {
 # Logs every matching pod rather than just the one we tracked -- when pod
 # resolution is what failed, the logs are exactly what explains why, and
 # reporting "(no logs captured)" in that case is the least useful outcome.
+# Both deployments are logged: a failure can now be in the producer (submit) or
+# the consumer (conversion), and guessing wrong wastes a whole CI run.
 capture_logs() {
   local slug="$1" pod i=0
   while IFS= read -r pod; do
@@ -159,41 +173,119 @@ capture_logs() {
       > "${LOG_DIR}/${slug}.${i}-${pod}.previous.log" 2>/dev/null || true
     [ -s "${LOG_DIR}/${slug}.${i}-${pod}.previous.log" ] \
       || rm -f "${LOG_DIR}/${slug}.${i}-${pod}.previous.log"
-  done <<< "$(kubectl get pods -n "$NAMESPACE" -l app=markitdown-server \
+  done <<< "$(kubectl get pods -n "$NAMESPACE" \
+                -l "app in (${WORKER_LABEL},${API_LABEL})" \
                 -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
 }
 
+# Only the worker is restarted: it owns the cgroup high-water mark being
+# measured, and bouncing the API would just drop the port-forward for nothing.
 restart_pod() {
-  kubectl rollout restart deployment/markitdown-server -n "$NAMESPACE" >/dev/null
-  kubectl rollout status deployment/markitdown-server -n "$NAMESPACE" \
+  kubectl rollout restart "deployment/${WORKER_LABEL}" -n "$NAMESPACE" >/dev/null
+  kubectl rollout status "deployment/${WORKER_LABEL}" -n "$NAMESPACE" \
     --timeout=300s >/dev/null || return 1
   start_port_forward
 }
 
-MEM_LIMIT_RAW=$(kubectl get deployment markitdown-server -n "$NAMESPACE" \
+# Submit a book and poll until the job reaches a terminal state.
+#
+# Echoes "<status> <total_length>"; status is `done`, `failed`, `timeout`, or
+# `http:<code>` when the submission itself was rejected.
+convert_book() {
+  local url="$1" deadline="$2" submit job_id code status doc_key
+
+  submit="$(curl -sS --max-time 120 -w '\n%{http_code}' \
+    -X POST "${BASE_URL}/async/convert" \
+    -H "x-api-key: ${ADMIN_API_KEY}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"file\": \"${url}\"}" 2>&1)"
+  code="$(printf '%s' "$submit" | tail -n1)"
+  payload="$(printf '%s' "$submit" | sed '$d')"
+
+  # 200 means a cache hit served it outright, which is a valid (and instant)
+  # outcome; 202 is the normal queued path.
+  if [ "$code" = "200" ]; then
+    printf 'done %s' "$(printf '%s' "$payload" | python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["pagination"]["total_length"])' \
+      2>/dev/null || echo '-')"
+    return 0
+  fi
+  if [ "$code" != "202" ]; then
+    printf 'http:%s -' "$code"
+    return 0
+  fi
+
+  job_id="$(printf '%s' "$payload" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["job_id"])' 2>/dev/null)"
+  doc_key="$(printf '%s' "$payload" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["doc_key"])' 2>/dev/null)"
+  if [ -z "$job_id" ]; then
+    printf 'http:bad-submit-payload -'
+    return 0
+  fi
+
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status="$(curl -sS --max-time 30 \
+      "${BASE_URL}/convert/jobs/${job_id}" \
+      -H "x-api-key: ${ADMIN_API_KEY}" 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' \
+        2>/dev/null)"
+    case "$status" in
+      done)
+        printf 'done %s' "$(curl -sS --max-time 30 \
+          "${BASE_URL}/convert/${doc_key}/pages/1" \
+          -H "x-api-key: ${ADMIN_API_KEY}" 2>/dev/null \
+          | python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["pagination"]["total_length"])' \
+            2>/dev/null || echo '-')"
+        return 0
+        ;;
+      failed)
+        printf 'failed -'
+        return 0
+        ;;
+    esac
+    sleep "$POLL_INTERVAL"
+  done
+  printf 'timeout -'
+}
+
+MEM_LIMIT_RAW=$(kubectl get deployment "${WORKER_LABEL}" -n "$NAMESPACE" \
   -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}' 2>/dev/null)
 MEM_LIMIT_MB=$(to_mib "$MEM_LIMIT_RAW")
 [ -z "$MEM_LIMIT_MB" ] && MEM_LIMIT_MB=0
 
 mkdir -p "$LOG_DIR"
 
-# The benchmark assumes a single replica: with more than one pod behind the
-# service, the request and the cgroup read can land on different pods and every
-# per-book number becomes meaningless. An active HPA breaks that assumption the
-# moment conversion saturates the CPU, so fail up front with the actual reason
-# rather than timing out later waiting for the pod set to settle.
-HPA_MAX="$(kubectl get hpa markitdown-server-hpa -n "$NAMESPACE" \
+# The benchmark assumes a single *worker* replica: peak memory is read from one
+# pod's cgroup, and with a fleet the work is spread across pods so that number
+# describes nothing. An active HPA breaks the assumption the moment conversion
+# saturates the CPU, so fail up front with the actual reason rather than timing
+# out later waiting for the pod set to settle.
+#
+# The API HPA is irrelevant here and deliberately not checked -- the API is
+# stateless and any pod can answer, which is the whole point of the split.
+HPA_MAX="$(kubectl get hpa "${WORKER_LABEL}-hpa" -n "$NAMESPACE" \
   -o jsonpath='{.spec.maxReplicas}' 2>/dev/null)"
 if [ -n "$HPA_MAX" ] && [ "$HPA_MAX" -gt 1 ]; then
-  echo "ERROR: HorizontalPodAutoscaler allows up to ${HPA_MAX} replicas."
+  echo "ERROR: HorizontalPodAutoscaler allows up to ${HPA_MAX} worker replicas."
   echo "       It will scale up under conversion load and invalidate the"
   echo "       measurements. Delete it before benchmarking:"
-  echo "         kubectl delete hpa markitdown-server-hpa -n ${NAMESPACE}"
+  echo "         kubectl delete hpa ${WORKER_LABEL}-hpa -n ${NAMESPACE}"
+  exit 1
+fi
+
+WORKER_REPLICAS="$(kubectl get deployment "${WORKER_LABEL}" -n "$NAMESPACE" \
+  -o jsonpath='{.spec.replicas}' 2>/dev/null)"
+if [ -n "$WORKER_REPLICAS" ] && [ "$WORKER_REPLICAS" -gt 1 ]; then
+  echo "ERROR: ${WORKER_LABEL} has ${WORKER_REPLICAS} replicas; peak memory"
+  echo "       would be split across pods. Pin it to one:"
+  echo "         kubectl scale deployment/${WORKER_LABEL} -n ${NAMESPACE} --replicas=1"
   exit 1
 fi
 
 echo "namespace=$NAMESPACE  memory_limit=${MEM_LIMIT_MB}Mi (${MEM_LIMIT_RAW})  budget_scale=${BUDGET_SCALE}"
-echo "(pod restarted before each book, so PEAK_MB is that book's own high-water mark)"
+echo "(worker restarted before each book, so PEAK_MB is that book's own high-water mark)"
 echo
 printf '%-30s %7s %8s %8s %8s %9s  %s\n' \
   BOOK SECONDS BUDGET PEAK_MB LIMIT_PCT CHARS VERDICT
@@ -221,7 +313,7 @@ for entry in "${BOOKS[@]}"; do
   if ! pod="$(pod_name)" || [ -z "$pod" ]; then
     printf '%-30s %7s %8s %8s %8s %9s  %s\n' \
       "$name" "-" "$budget" "-" "-" "-" "FAIL could not resolve a single serving pod"
-    kubectl get pods -n "$NAMESPACE" -l app=markitdown-server 2>&1 | head -10
+    kubectl get pods -n "$NAMESPACE" -l "app in (${WORKER_LABEL},${API_LABEL})" 2>&1 | head -10
     capture_logs "$slug"
     FAILED_BOOKS+=("$slug|$name")
     failures=$((failures + 1))
@@ -231,18 +323,13 @@ for entry in "${BOOKS[@]}"; do
   [ -z "$restarts_before" ] && restarts_before=0
 
   start=$(date +%s.%N)
-  # Cap the request just past the budget: a hang should fail on the budget, not
-  # sit until the job-level timeout kills the whole run.
+  # Cap the poll just past the budget: a hung job should fail on the budget,
+  # not sit until the job-level timeout kills the whole run.
   max_time=$(awk -v b="$budget" 'BEGIN{printf "%.0f", b*1.5+60}')
-  body="$(curl -sS --max-time "$max_time" -w '\n%{http_code}' \
-    -X POST "${BASE_URL}/convert" \
-    -H "x-api-key: ${ADMIN_API_KEY}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"file\": \"${url}\"}" 2>&1)"
+  deadline=$(( $(date +%s) + max_time ))
+  read -r status chars <<< "$(convert_book "$url" "$deadline")"
   end=$(date +%s.%N)
 
-  status="$(printf '%s' "$body" | tail -n1)"
-  payload="$(printf '%s' "$body" | sed '$d')"
   seconds="$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.1f", b-a}')"
 
   pod_after="$(pod_name)" || pod_after=""
@@ -267,8 +354,8 @@ for entry in "${BOOKS[@]}"; do
   elif [ "$peak" = "?" ]; then
     verdict="FAIL could not read peak memory from the pod cgroup"
     failures=$((failures + 1))
-  elif [ "$status" != "200" ]; then
-    verdict="FAIL http=$status"
+  elif [ "$status" != "done" ]; then
+    verdict="FAIL job status=$status"
     failures=$((failures + 1))
   elif [ "$(awk -v s="$seconds" -v b="$budget" 'BEGIN{print (s>b)?1:0}')" = "1" ]; then
     verdict="FAIL over time budget"
@@ -286,16 +373,8 @@ for entry in "${BOOKS[@]}"; do
     pct="${raw_pct}%"
   fi
 
-  chars="$(printf '%s' "$payload" | python3 -c \
-    'import json,sys; print(json.load(sys.stdin)["pagination"]["total_length"])' \
-    2>/dev/null || echo "-")"
-
   printf '%-30s %7s %8s %8s %8s %9s  %s\n' \
     "$name" "$seconds" "$budget" "$peak" "$pct" "$chars" "$verdict"
-
-  if [ "$status" != "200" ]; then
-    echo "    $(printf '%s' "$payload" | head -c 300)"
-  fi
 
   capture_logs "$slug"
   if [ "$verdict" != "ok" ]; then
@@ -328,7 +407,7 @@ if [ "$failures" -gt 0 ]; then
   fi
   echo
   echo "--- pod status ---"
-  kubectl get pods -n "$NAMESPACE" -l app=markitdown-server 2>&1 | head -10
+  kubectl get pods -n "$NAMESPACE" -l "app in (${WORKER_LABEL},${API_LABEL})" 2>&1 | head -10
   exit 1
 fi
 echo "All books converted within time and memory budgets."

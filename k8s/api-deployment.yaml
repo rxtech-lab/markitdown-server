@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markitdown-api
+  namespace: markitdown-server
+  labels:
+    app: markitdown-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: markitdown-api
+  template:
+    metadata:
+      labels:
+        app: markitdown-api
+    spec:
+      # The API no longer parses documents — it downloads, hashes and enqueues.
+      # /convert still holds the HTTP request open while workers finish, so let
+      # in-flight synchronous callers drain during a rollout.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: markitdown-api
+          image: ghcr.io/sirily11/markitdown-server:latest
+          resources:
+            limits:
+              # Sized for download + SHA-256 + enqueue. markitdown is imported
+              # lazily and never on this path, so its ~150-190Mi is not paid
+              # for here.
+              memory: "512Mi"
+              cpu: "500m"
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+          env:
+            # NOTE: `env` takes precedence over `envFrom`, so these in-cluster
+            # defaults win over anything of the same name in the secret. To run
+            # against hosted Turso or R2, delete the relevant entries and supply
+            # them via the secret instead — changing only the secret will not
+            # take effect while they are here.
+            # RABBITMQ_URL is intentionally absent here: it arrives whole from
+            # the secret via envFrom, so the broker (in-cluster rabbitmq.yaml
+            # vs a shared one in another namespace) is a secret-only change.
+            # It used to be pinned here only because it was assembled from
+            # $(RABBITMQ_USER) — and $(VAR) expands solely from earlier entries
+            # in this same list, never from envFrom.
+            - name: TURSO_DATABASE_URL
+              value: "http://markitdown-libsql:8080"
+            - name: S3_ENDPOINT
+              value: "http://markitdown-minio:9000"
+            - name: S3_BUCKET
+              value: "markitdown"
+            - name: OPENAI_MODEL
+              value: "google/gemini-3.1-flash-lite-preview"
+            - name: PDF_PAGES_PER_CHUNK
+              value: "20"
+            - name: PDF_MIN_PAGES_FOR_PARALLEL
+              value: "40"
+          envFrom:
+            # ADMIN_API_KEY, OPENAI_API_KEY, S3_ACCESS_KEY_ID,
+            # S3_SECRET_ACCESS_KEY (and TURSO_AUTH_TOKEN when managed).
+            - secretRef:
+                name: markitdown-server-secret
+          livenessProbe:
+            # Deliberately the dependency-free endpoint: a database or storage
+            # blip should take the pod out of the Service (readiness), not
+            # restart it.
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # Name kept from the pre-split deployment so the ingress and the benchmark's
+  # port-forward do not need to change.
+  name: markitdown-server
+  namespace: markitdown-server
+  labels:
+    app: markitdown-api
+spec:
+  selector:
+    app: markitdown-api
+  ports:
+    - port: 8080
+      targetPort: 8000
+  type: ClusterIP

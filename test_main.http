@@ -5,9 +5,16 @@ Accept: application/json
 
 ###
 
-# Convert a (possibly long) document to markdown.
-# Returns the first page + pagination metadata. The full paginated content
-# is cached in Redis for 5 minutes under the returned `id`.
+# Readiness: checks the database and object store.
+GET http://127.0.0.1:8000/readyz
+Accept: application/json
+
+###
+
+# Convert a document synchronously.
+#
+# Workers still convert chunks in parallel, but this request waits for all of
+# them and returns the original {id, content, pagination} response.
 POST http://127.0.0.1:8000/convert
 Content-Type: application/json
 x-api-key: NxQUCbbezCZ8KUhMtg5s0MQTQU4gDQ7
@@ -18,9 +25,29 @@ x-api-key: NxQUCbbezCZ8KUhMtg5s0MQTQU4gDQ7
 
 ###
 
-# Fetch a subsequent page of a previously converted document.
-# Use the `id` and `pagination.next_page` returned by /convert.
-GET http://127.0.0.1:8000/convert/REPLACE_WITH_DOC_ID/pages/2
+# Submit a document asynchronously. Returns 202 with a `job_id` and `doc_key`;
+# if this exact file was converted before, returns the first page immediately.
+POST http://127.0.0.1:8000/async/convert
+Content-Type: application/json
+x-api-key: NxQUCbbezCZ8KUhMtg5s0MQTQU4gDQ7
+
+{
+  "file": "https://example.com/some-long-document.pdf"
+}
+
+###
+
+# Poll a job. `status` goes queued -> running -> done (or failed), and
+# `progress` reports how many chunks have finished.
+GET http://127.0.0.1:8000/convert/jobs/REPLACE_WITH_JOB_ID
+Accept: application/json
+x-api-key: NxQUCbbezCZ8KUhMtg5s0MQTQU4gDQ7
+
+###
+
+# Fetch a page once the job is done. Use the `doc_key` from the submission
+# response and `pagination.next_page` to walk the document.
+GET http://127.0.0.1:8000/convert/REPLACE_WITH_DOC_KEY/pages/1
 Accept: application/json
 x-api-key: NxQUCbbezCZ8KUhMtg5s0MQTQU4gDQ7
 

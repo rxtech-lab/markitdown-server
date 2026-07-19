@@ -5,7 +5,13 @@ namespace: markitdown-server
 
 resources:
   - namespace.yaml
-  - redis.yaml
-  - deployment.yaml
+  # Self-hosted infrastructure. Drop libsql/minio and repoint the secret at
+  # hosted Turso and R2/S3 to run those managed; the application is identical
+  # either way.
+  - rabbitmq.yaml
+  - libsql.yaml
+  - minio.yaml
+  - api-deployment.yaml
+  - worker-deployment.yaml
   - hpa.yaml
   - ingress.yaml

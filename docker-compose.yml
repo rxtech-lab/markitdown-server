@@ -1,0 +1,35 @@
+# Local dependencies only.
+#
+# The database is remote (Turso) — see TURSO_DATABASE_URL in .env. What has to
+# run locally is the broker that distributes chunks, and object storage for the
+# source files and converted pages.
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: markitdown-rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5673}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15673}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: markitdown-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9100}:9000"
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+
+volumes:
+  rabbitmq-data:
+  minio-data:

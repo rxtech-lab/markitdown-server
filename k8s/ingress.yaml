@@ -5,17 +5,17 @@ metadata:
   namespace: markitdown-server
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
-    nginx.ingress.kubernetes.io/proxy-body-size: "1000m"
-    # Large PDFs take several minutes to parse; nginx's 60s default cut the
-    # connection mid-conversion and returned a 504 to the caller.
+    # Request bodies are a JSON object holding a URL; the source document is
+    # fetched server-side, so the old 1000m cap was vestigial.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    # /convert preserves the original blocking contract, and large PDFs can
+    # take several minutes. /async/convert is available to avoid a long request.
     nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
-    nginx.ingress.kubernetes.io/affinity: "cookie"
-    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
-    nginx.ingress.kubernetes.io/session-cookie-name: "mcp-router-affinity"
-    nginx.ingress.kubernetes.io/session-cookie-max-age: "86400"
-    nginx.ingress.kubernetes.io/session-cookie-path: "/"
+    # No session affinity: every pod reads the same database and object store,
+    # so any pod can answer any request. Affinity is what made replicas > 1
+    # useless before.
 spec:
   ingressClassName: nginx
   tls:
